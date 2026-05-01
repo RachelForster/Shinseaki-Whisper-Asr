@@ -1,0 +1,5 @@
+# Install into plugin venv / host env when Whisper ASR plugin is enabled.
+faster-whisper
+realtimestt
+numpy
+PyAudio
