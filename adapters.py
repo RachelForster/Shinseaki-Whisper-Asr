@@ -14,6 +14,7 @@ from asr.asr_adapter import get_asr_log
 
 _log = get_asr_log()
 
+_silero_vad_trust_lock = threading.Lock()
 _silero_vad_pretrusted = False
 
 
@@ -23,24 +24,29 @@ def _ensure_silero_vad_trusted() -> None:
     这里先以 trust_repo=True 预载一次，把仓库写入 torch.hub 信任列表并落缓存，
     之后 RealtimeSTT 自己的加载不再触发交互确认。"""
     global _silero_vad_pretrusted
-    if _silero_vad_pretrusted:
-        return
-    try:
-        import torch
-
-        torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-            verbose=False,
-        )
+    with _silero_vad_trust_lock:
+        if _silero_vad_pretrusted:
+            return
+        try:
+            import torch
+        except ImportError as e:
+            _log.warning("torch 未安装，跳过 Silero VAD 预信任：%s", e)
+            return
+        try:
+            torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                trust_repo=True,
+                verbose=False,
+            )
+        except Exception:
+            _log.warning(
+                "Silero VAD 预信任失败，RealtimeSTT 首次加载可能因 trust 确认无法输入而失败",
+                exc_info=True,
+            )
+            return
         _silero_vad_pretrusted = True
         _log.info("Silero VAD 已预信任并缓存（torch.hub trust_repo=True）")
-    except Exception:
-        _log.warning(
-            "Silero VAD 预信任失败，RealtimeSTT 首次加载可能因 trust 确认无法输入而失败",
-            exc_info=True,
-        )
 
 
 def _realtimestt_compute_sanitize(device: str, user_pref: str) -> str:
