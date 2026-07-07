@@ -14,6 +14,41 @@ from asr.asr_adapter import get_asr_log
 
 _log = get_asr_log()
 
+_silero_vad_trust_lock = threading.Lock()
+_silero_vad_pretrusted = False
+
+
+def _ensure_silero_vad_trusted() -> None:
+    """RealtimeSTT 内部经 torch.hub 加载 Silero VAD 且未传 trust_repo；
+    首次使用时 torch.hub 会用 input() 询问是否信任仓库，后台线程无 stdin 直接 EOF。
+    这里先以 trust_repo=True 预载一次，把仓库写入 torch.hub 信任列表并落缓存，
+    之后 RealtimeSTT 自己的加载不再触发交互确认。"""
+    global _silero_vad_pretrusted
+    with _silero_vad_trust_lock:
+        if _silero_vad_pretrusted:
+            return
+        try:
+            import torch
+        except ImportError as e:
+            _log.warning("torch 未安装，跳过 Silero VAD 预信任：%s", e)
+            return
+        try:
+            torch.hub.load(
+                repo_or_dir="snakers4/silero-vad",
+                model="silero_vad",
+                trust_repo=True,
+                verbose=False,
+            )
+        except Exception:
+            _log.warning(
+                "Silero VAD 预信任失败，RealtimeSTT 首次加载可能因 trust 确认无法输入而失败",
+                exc_info=True,
+            )
+            return
+        _silero_vad_pretrusted = True
+        _log.info("Silero VAD 已预信任并缓存（torch.hub trust_repo=True）")
+
+
 def _realtimestt_compute_sanitize(device: str, user_pref: str) -> str:
     """RealtimeSTT 在子进程内加载模型且无回退；CUDA 上 int8_float16 常在用户环境下报错。"""
     d = (device or "cpu").strip().lower()
@@ -102,6 +137,7 @@ class RealtimeSTTAdapter(ASRAdapter):
     def _setup_recorder(self) -> None:
         from RealtimeSTT import AudioToTextRecorder
 
+        _ensure_silero_vad_trusted()
         dev = self._device_resolved(self._device_pref)
         ct = self._compute_for_recorder(dev)
         _log.info(
