@@ -86,6 +86,11 @@ class RealtimeSTTAdapter(ASRAdapter):
         self._loop_thread: Optional[threading.Thread] = None
         self._is_running = False
         self._paused = False
+        self._partial_lock = threading.Lock()
+        self._latest_partial_text = ""
+        self._endpoint_final_emitted = False
+        self._endpoint_final_timer: Optional[threading.Timer] = None
+        self._endpoint_generation = 0
         if os.name == "nt":
             venv_path = sys.prefix
             nvidia_base = os.path.join(venv_path, r"Lib\site-packages\nvidia")
@@ -102,19 +107,22 @@ class RealtimeSTTAdapter(ASRAdapter):
         p = (pref or "auto").strip().lower()
         if p == "cpu":
             return "cpu"
-        if p == "cuda":
-            try:
-                import torch
-
-                return "cuda" if torch.cuda.is_available() else "cpu"
-            except Exception:
-                return "cpu"
+        # faster-whisper runs on CTranslate2, so its CUDA probe is authoritative.
+        # The packaged runtime intentionally may contain a CPU-only PyTorch build
+        # for unrelated features even when CTranslate2 can use the NVIDIA GPU.
         try:
-            import torch
+            import ctranslate2
 
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if ctranslate2.get_cuda_device_count() > 0:
+                return "cuda"
         except Exception:
-            return "cpu"
+            _log.debug("CTranslate2 CUDA probe failed", exc_info=True)
+        if p == "cuda":
+            _log.warning(
+                "RealtimeSTT requested CUDA, but CTranslate2 found no CUDA device; "
+                "falling back to CPU"
+            )
+        return "cpu"
 
     def _compute_resolved(self, device: str) -> str:
         c = (self._compute_pref or "").strip()
@@ -134,6 +142,35 @@ class RealtimeSTTAdapter(ASRAdapter):
             return "日本語の会話です。"
         return None
 
+    def _cancel_endpoint_final_timer_locked(self) -> None:
+        self._endpoint_generation += 1
+        timer = self._endpoint_final_timer
+        self._endpoint_final_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _emit_endpoint_final_fallback(self, generation: int, text: str) -> None:
+        with self._partial_lock:
+            if generation != self._endpoint_generation:
+                return
+            self._endpoint_final_timer = None
+            should_emit = (
+                bool(text)
+                and self._is_running
+                and not self._paused
+                and not self._endpoint_final_emitted
+            )
+            if should_emit:
+                self._endpoint_final_emitted = True
+        if not should_emit:
+            return
+        _log.info(
+            "RealtimeSTT main final unavailable after endpoint grace; "
+            "using latest partial: %s",
+            text[:300],
+        )
+        self.callback(text, False)
+
     def _setup_recorder(self) -> None:
         from RealtimeSTT import AudioToTextRecorder
 
@@ -151,23 +188,87 @@ class RealtimeSTTAdapter(ASRAdapter):
         def on_rt_update(text: str) -> None:
             t = (text or "").strip()
             if t:
+                with self._partial_lock:
+                    self._latest_partial_text = t
                 _log.debug(
                     "RealtimeSTT realtime partial: %s",
                     t[:200] + ("…" if len(t) > 200 else ""),
                 )
                 self.callback(t, True)
 
-        self._recorder = AudioToTextRecorder(
-            model=self._model_name,
-            language=(self.language or "").strip(),
-            compute_type=ct,
-            device=dev,
-            enable_realtime_transcription=True,
-            use_main_model_for_realtime=True,
-            on_realtime_transcription_update=on_rt_update,
-            spinner=False,
-            initial_prompt=self._initial_prompt_optional(),
-        )
+        def on_recording_stop() -> None:
+            """Give the main model a grace period before falling back to partial.
+
+            A recording endpoint follows a natural pause, but the realtime
+            hypothesis is not necessarily the accurate final transcript.  Let
+            ``rec.text()`` win when it returns promptly and only promote the
+            cached partial if the main-model final is unavailable.
+            """
+            with self._partial_lock:
+                self._cancel_endpoint_final_timer_locked()
+                text = self._latest_partial_text.strip()
+                should_schedule = (
+                    bool(text)
+                    and self._is_running
+                    and not self._paused
+                    and not self._endpoint_final_emitted
+                )
+                if should_schedule:
+                    generation = self._endpoint_generation
+                    timer = threading.Timer(
+                        0.5,
+                        self._emit_endpoint_final_fallback,
+                        args=(generation, text),
+                    )
+                    timer.daemon = True
+                    self._endpoint_final_timer = timer
+            if not should_schedule:
+                return
+            _log.debug(
+                "RealtimeSTT recording stopped; waiting for main final before fallback"
+            )
+            timer.start()
+
+        # RealtimeSTT currently re-checks a requested CUDA device with
+        # torch.cuda.is_available().  The packaged runtime can intentionally
+        # use CPU-only Torch while faster-whisper's CTranslate2 has full CUDA
+        # support, which otherwise changes ``cuda + float16`` into the invalid
+        # ``cpu + float16`` pair and leaves the parent waiting forever for the
+        # failed model worker.  Override only that constructor-time gate.
+        recorder_module = sys.modules.get(AudioToTextRecorder.__module__)
+        recorder_torch = getattr(recorder_module, "torch", None)
+        original_cuda_probe = None
+        if dev == "cuda" and recorder_torch is not None:
+            try:
+                if not recorder_torch.cuda.is_available():
+                    original_cuda_probe = recorder_torch.cuda.is_available
+                    recorder_torch.cuda.is_available = lambda: True
+                    _log.info(
+                        "RealtimeSTT preserving CTranslate2 CUDA device despite "
+                        "CPU-only packaged PyTorch"
+                    )
+            except Exception:
+                _log.debug(
+                    "Could not override RealtimeSTT PyTorch CUDA gate",
+                    exc_info=True,
+                )
+        try:
+            self._recorder = AudioToTextRecorder(
+                model=self._model_name,
+                language=(self.language or "").strip(),
+                compute_type=ct,
+                device=dev,
+                enable_realtime_transcription=True,
+                use_main_model_for_realtime=True,
+                on_realtime_transcription_update=on_rt_update,
+                on_recording_stop=on_recording_stop,
+                post_speech_silence_duration=2.5,
+                spinner=False,
+                initial_prompt=self._initial_prompt_optional(),
+            )
+        finally:
+            if original_cuda_probe is not None:
+                recorder_torch.cuda.is_available = original_cuda_probe
 
     def _text_loop(self) -> None:
         cycle = 0
@@ -181,6 +282,10 @@ class RealtimeSTTAdapter(ASRAdapter):
                 break
             try:
                 cycle += 1
+                with self._partial_lock:
+                    if self._endpoint_final_timer is None:
+                        self._latest_partial_text = ""
+                        self._endpoint_final_emitted = False
                 _log.debug("RealtimeSTT text() cycle #%s start", cycle)
                 final = rec.text()
                 if not self._is_running:
@@ -194,6 +299,17 @@ class RealtimeSTTAdapter(ASRAdapter):
                     continue
                 ft = (final or "").strip()
                 if ft:
+                    with self._partial_lock:
+                        endpoint_final_emitted = self._endpoint_final_emitted
+                        self._cancel_endpoint_final_timer_locked()
+                        self._latest_partial_text = ""
+                        self._endpoint_final_emitted = False
+                    if endpoint_final_emitted:
+                        _log.debug(
+                            "RealtimeSTT text() cycle #%s final already emitted at recording stop",
+                            cycle,
+                        )
+                        continue
                     _log.info(
                         "RealtimeSTT text() cycle #%s final: %s",
                         cycle,
@@ -241,6 +357,10 @@ class RealtimeSTTAdapter(ASRAdapter):
         _log.info("RealtimeSTT stopping…")
         self._is_running = False
         self._paused = False
+        with self._partial_lock:
+            self._cancel_endpoint_final_timer_locked()
+            self._latest_partial_text = ""
+            self._endpoint_final_emitted = False
         self._recorder = None
         self._loop_thread = None
         if rec is not None:
@@ -265,6 +385,10 @@ class RealtimeSTTAdapter(ASRAdapter):
             _log.debug("RealtimeSTT pause: already paused, skip")
             return
         self._paused = True
+        with self._partial_lock:
+            self._cancel_endpoint_final_timer_locked()
+            self._latest_partial_text = ""
+            self._endpoint_final_emitted = False
         _log.info("RealtimeSTT pause: scheduling abort on helper thread")
         rec = self._recorder
         if rec is not None:
@@ -286,6 +410,10 @@ class RealtimeSTTAdapter(ASRAdapter):
 
     def resume(self) -> None:
         _log.info("RealtimeSTT resume: clear pause + events + listen()")
+        with self._partial_lock:
+            self._cancel_endpoint_final_timer_locked()
+            self._latest_partial_text = ""
+            self._endpoint_final_emitted = False
         self._paused = False
         rec = self._recorder
         if rec is None:
