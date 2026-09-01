@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from sdk.adapters.asr import ASRAdapter, TranscriptionCallback
 
-from asr.asr_adapter import get_asr_log
+from ai.asr.asr_adapter import get_asr_log
 
 _log = get_asr_log()
 
